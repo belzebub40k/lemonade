@@ -31,6 +31,11 @@ public:
     // OpenAI compatibility: mirror max_completion_tokens to legacy max_tokens
     // when the request does not already provide max_tokens.
     static void add_legacy_max_tokens_alias(json& request);
+
+    // OpenAI-compatible backends report token usage on a streamed response only
+    // when asked. Callers that translate the stream into another dialect need
+    // those numbers to fill their own protocol's usage fields.
+    static void request_streamed_usage(json& request);
     static json with_legacy_max_tokens_alias(const json& request);
 
     // Check if JSON has key

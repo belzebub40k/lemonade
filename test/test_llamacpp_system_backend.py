@@ -490,6 +490,75 @@ class LlamaCppSystemBackendTests(unittest.TestCase):
     @unittest.skipUnless(
         sys.platform.startswith("linux"), "System backend only supported on Linux"
     )
+    def test_006g_translated_streams_request_usage(self):
+        """Ollama and Anthropic fill their own usage fields, so they must ask for it."""
+        for label, path, payload in [
+            (
+                "ollama",
+                "/api/chat",
+                {
+                    "model": ENDPOINT_TEST_MODEL,
+                    "messages": [{"role": "user", "content": "Say hello."}],
+                    "stream": True,
+                },
+            ),
+            (
+                "anthropic",
+                "/v1/messages",
+                {
+                    "model": ENDPOINT_TEST_MODEL,
+                    "messages": [{"role": "user", "content": "Say hello."}],
+                    "max_tokens": 8,
+                    "stream": True,
+                },
+            ),
+        ]:
+            with self.subTest(dialect=label):
+                response = requests.post(
+                    f"http://localhost:{PORT}{path}",
+                    json=payload,
+                    stream=True,
+                    timeout=TIMEOUT_DEFAULT,
+                )
+                self.assertEqual(response.status_code, 200)
+                for _ in response.iter_lines():
+                    pass
+
+                with open(self.capture_path, "r", encoding="utf-8") as handle:
+                    forwarded_request = json.load(handle)
+
+                self.assertIs(
+                    forwarded_request["stream_options"]["include_usage"], True
+                )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "System backend only supported on Linux"
+    )
+    def test_006h_openai_passthrough_keeps_its_stream_shape(self):
+        """A relayed stream must not gain a usage frame the client never asked for."""
+        response = requests.post(
+            f"http://localhost:{PORT}/api/v1/chat/completions",
+            json={
+                "model": ENDPOINT_TEST_MODEL,
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "stream": True,
+                "max_tokens": 8,
+            },
+            stream=True,
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200)
+        for _ in response.iter_lines():
+            pass
+
+        with open(self.capture_path, "r", encoding="utf-8") as handle:
+            forwarded_request = json.load(handle)
+
+        self.assertNotIn("stream_options", forwarded_request)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "System backend only supported on Linux"
+    )
     def test_007_enable_thinking_takes_precedence_over_thinking_false(self):
         """Verify enable_thinking:true takes precedence over thinking:false."""
         response = requests.post(
