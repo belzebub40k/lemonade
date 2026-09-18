@@ -117,6 +117,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         request_json = json.loads(body)
+        reasoning = control.get("reasoning_content")
+
         if request_json.get("stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -128,6 +130,16 @@ class Handler(BaseHTTPRequestHandler):
                     "object": "chat.completion.chunk",
                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                 },
+            ]
+            if reasoning:
+                chunks.append({
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": None}
+                    ],
+                })
+            chunks += [
                 {
                     "id": "chatcmpl-mock",
                     "object": "chat.completion.chunk",
@@ -146,6 +158,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             return
 
+        message = {"role": "assistant", "content": "hello"}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+
         self._send_json(
             {
                 "id": "chatcmpl-mock",
@@ -153,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": "hello"},
+                        "message": message,
                         "finish_reason": "stop",
                     }
                 ],
@@ -570,6 +586,80 @@ class LlamaCppSystemBackendTests(unittest.TestCase):
             "/no_think\nSay hello.",
         )
         self.assertNotIn("enable_thinking", forwarded_request)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "System backend only supported on Linux"
+    )
+    def test_006e_anthropic_surfaces_a_thinking_block(self):
+        """A reasoning trace must reach the client as a thinking block, not vanish."""
+        self._write_mock_control({"reasoning_content": "step one, step two"})
+
+        response = requests.post(
+            f"http://localhost:{PORT}/v1/messages",
+            json={
+                "model": ENDPOINT_TEST_MODEL,
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "max_tokens": 8,
+            },
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        blocks = response.json()["content"]
+        self.assertEqual([block["type"] for block in blocks], ["thinking", "text"])
+        self.assertEqual(blocks[0]["thinking"], "step one, step two")
+        self.assertEqual(blocks[1]["text"], "hello")
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "System backend only supported on Linux"
+    )
+    def test_006f_anthropic_streams_a_thinking_block(self):
+        """Streamed reasoning must be its own block, closed before the text block."""
+        self._write_mock_control({"reasoning_content": "step one, step two"})
+
+        response = requests.post(
+            f"http://localhost:{PORT}/v1/messages",
+            json={
+                "model": ENDPOINT_TEST_MODEL,
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "max_tokens": 8,
+                "stream": True,
+            },
+            stream=True,
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        events = []
+        for raw in response.iter_lines():
+            line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            if line and line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+
+        starts = [e for e in events if e["type"] == "content_block_start"]
+        self.assertEqual(
+            [(e["index"], e["content_block"]["type"]) for e in starts],
+            [(0, "thinking"), (1, "text")],
+        )
+
+        thinking = "".join(
+            e["delta"]["thinking"]
+            for e in events
+            if e["type"] == "content_block_delta"
+            and e["delta"]["type"] == "thinking_delta"
+        )
+        self.assertEqual(thinking, "step one, step two")
+
+        order = [
+            (e["type"], e["index"])
+            for e in events
+            if e["type"] in ("content_block_start", "content_block_stop")
+        ]
+        self.assertLess(
+            order.index(("content_block_stop", 0)),
+            order.index(("content_block_start", 1)),
+            "the thinking block must close before the text block opens",
+        )
 
     @unittest.skipUnless(
         sys.platform.startswith("linux"), "System backend only supported on Linux"

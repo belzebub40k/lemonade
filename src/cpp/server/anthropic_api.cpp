@@ -66,6 +66,17 @@ static std::string join_text_blocks(const json& value, std::vector<std::string>&
     return join_strings(parts);
 }
 
+// Backends disagree on the field name for a reasoning trace, and a delta
+// carries the same shapes as a full message.
+static std::string extract_reasoning_text(const json& message) {
+    for (const char* key : {"reasoning_content", "thinking"}) {
+        if (message.contains(key) && message[key].is_string()) {
+            return message[key].get<std::string>();
+        }
+    }
+    return {};
+}
+
 static std::string map_finish_reason_to_anthropic_stop_reason(const json& choice) {
     std::string finish_reason = choice.value("finish_reason", "stop");
 
@@ -546,6 +557,12 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                         continue;
                     }
 
+                    // Clients replay the thinking blocks we emit; the trace is
+                    // not part of the prompt, so drop it without complaining.
+                    if (type == "thinking" || type == "redacted_thinking") {
+                        continue;
+                    }
+
                     add_warning(warnings, "Ignored unsupported message content block type: " + type);
                 }
             } else if (msg.contains("content")) {
@@ -706,6 +723,7 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
                                                  const std::vector<std::string>& warnings) {
     std::vector<std::string> mutable_warnings = warnings;
     std::string response_text;
+    std::string reasoning_text;
     json content_blocks = json::array();
     std::string stop_reason = "end_turn";
     std::string response_id = openai_response.value("id", generate_anthropic_message_id());
@@ -717,6 +735,7 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
 
         if (choice.contains("message") && choice["message"].is_object()) {
             const auto& message = choice["message"];
+            reasoning_text = extract_reasoning_text(message);
             if (message.contains("content") && message["content"].is_string()) {
                 response_text = message["content"].get<std::string>();
             } else if (message.contains("content") && message["content"].is_array()) {
@@ -767,6 +786,21 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
             merged_blocks.push_back(block);
         }
         content_blocks = merged_blocks;
+    }
+
+    // Anthropic orders the reasoning trace ahead of the reply. No signature is
+    // emitted: the field authenticates Anthropic's own output and a local
+    // backend has nothing to sign with.
+    if (!reasoning_text.empty()) {
+        json with_thinking = json::array();
+        with_thinking.push_back({
+            {"type", "thinking"},
+            {"thinking", reasoning_text}
+        });
+        for (const auto& block : content_blocks) {
+            with_thinking.push_back(block);
+        }
+        content_blocks = with_thinking;
     }
 
     if (stop_reason == "end_turn") {
@@ -823,10 +857,30 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
     std::vector<bool> stopped_tool_blocks;
     std::vector<std::string> tool_ids;
     std::vector<std::string> tool_names;
+    std::vector<int> tool_block_indices;
     std::string stop_reason = "end_turn";
     int input_tokens = 0;
     int output_tokens = 0;
     std::string message_id = generate_anthropic_message_id();
+
+    // Blocks are numbered in emission order rather than by kind, so a turn
+    // without a reasoning trace still starts at zero.
+    int next_block_index = 0;
+    int thinking_index = -1;
+    int text_index = -1;
+
+    auto close_thinking_block = [&client_sink, &thinking_index]() -> bool {
+        if (thinking_index < 0) {
+            return true;
+        }
+        int closed_index = thinking_index;
+        // Reset so a later reasoning delta (e.g. after an interleaved tool
+        // call) reopens a fresh thinking block instead of reusing an index
+        // that already received content_block_stop.
+        thinking_index = -1;
+        return write_sse_event(client_sink, "content_block_stop",
+                               json{{"type", "content_block_stop"}, {"index", closed_index}});
+    };
 
     adapter_sink.is_writable = client_sink.is_writable;
 
@@ -840,6 +894,11 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
                           &stopped_tool_blocks,
                           &tool_ids,
                           &tool_names,
+                          &tool_block_indices,
+                          &next_block_index,
+                          &thinking_index,
+                          &text_index,
+                          &close_thinking_block,
                           &stop_reason,
                           &input_tokens,
                           &output_tokens,
@@ -915,13 +974,42 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
 
                     if (choice.contains("delta") && choice["delta"].is_object()) {
                         const auto& delta = choice["delta"];
+
+                        const std::string reasoning_delta = extract_reasoning_text(delta);
+                        if (!reasoning_delta.empty()) {
+                            if (thinking_index < 0) {
+                                thinking_index = next_block_index++;
+                                json thinking_start = {
+                                    {"type", "content_block_start"},
+                                    {"index", thinking_index},
+                                    {"content_block", {{"type", "thinking"}, {"thinking", ""}}}
+                                };
+                                if (!write_sse_event(client_sink, "content_block_start", thinking_start)) {
+                                    return false;
+                                }
+                            }
+
+                            json thinking_delta = {
+                                {"type", "content_block_delta"},
+                                {"index", thinking_index},
+                                {"delta", {{"type", "thinking_delta"}, {"thinking", reasoning_delta}}}
+                            };
+                            if (!write_sse_event(client_sink, "content_block_delta", thinking_delta)) {
+                                return false;
+                            }
+                        }
+
                         if (delta.contains("content") && delta["content"].is_string()) {
                             std::string delta_text = delta["content"].get<std::string>();
                             if (!delta_text.empty()) {
                                 if (!sent_text_content_start) {
+                                    if (!close_thinking_block()) {
+                                        return false;
+                                    }
+                                    text_index = next_block_index++;
                                     json content_start = {
                                         {"type", "content_block_start"},
-                                        {"index", 0},
+                                        {"index", text_index},
                                         {"content_block", {{"type", "text"}, {"text", ""}}}
                                     };
                                     if (!write_sse_event(client_sink, "content_block_start", content_start)) {
@@ -932,7 +1020,7 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
 
                                 json content_delta = {
                                     {"type", "content_block_delta"},
-                                    {"index", 0},
+                                    {"index", text_index},
                                     {"delta", {{"type", "text_delta"}, {"text", delta_text}}}
                                 };
                                 if (!write_sse_event(client_sink, "content_block_delta", content_delta)) {
@@ -958,6 +1046,7 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
                                     stopped_tool_blocks.resize(idx + 1, false);
                                     tool_ids.resize(idx + 1);
                                     tool_names.resize(idx + 1);
+                                    tool_block_indices.resize(idx + 1, -1);
                                 }
 
                                 if (tool_delta.contains("id") && tool_delta["id"].is_string()) {
@@ -978,10 +1067,14 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
                                     if (tool_names[idx].empty()) {
                                         tool_names[idx] = "unknown_tool";
                                     }
+                                    if (!close_thinking_block()) {
+                                        return false;
+                                    }
+                                    tool_block_indices[idx] = next_block_index++;
 
                                     json tool_block_start = {
                                         {"type", "content_block_start"},
-                                        {"index", static_cast<int>(idx) + 1},
+                                        {"index", tool_block_indices[idx]},
                                         {"content_block", {
                                             {"type", "tool_use"},
                                             {"id", tool_ids[idx]},
@@ -1002,7 +1095,7 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
                                         if (!args_delta.empty()) {
                                             json tool_input_delta = {
                                                 {"type", "content_block_delta"},
-                                                {"index", static_cast<int>(idx) + 1},
+                                                {"index", tool_block_indices[idx]},
                                                 {"delta", {
                                                     {"type", "input_json_delta"},
                                                     {"partial_json", args_delta}
@@ -1036,6 +1129,10 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
                          &sent_error,
                          &started_tool_blocks,
                          &stopped_tool_blocks,
+                         &tool_block_indices,
+                         &next_block_index,
+                         &text_index,
+                         &close_thinking_block,
                          &stop_reason,
                          &input_tokens,
                          &output_tokens,
@@ -1068,10 +1165,16 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
             sent_message_start = true;
         }
 
+        if (!close_thinking_block()) {
+            client_sink.done();
+            return;
+        }
+
         if (!sent_text_content_start && started_tool_blocks.empty()) {
+            text_index = next_block_index++;
             json content_start = {
                 {"type", "content_block_start"},
-                {"index", 0},
+                {"index", text_index},
                 {"content_block", {{"type", "text"}, {"text", ""}}}
             };
             if (!write_sse_event(client_sink, "content_block_start", content_start)) {
@@ -1084,7 +1187,7 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
         if (sent_text_content_start && !sent_text_content_stop) {
             json content_stop = {
                 {"type", "content_block_stop"},
-                {"index", 0}
+                {"index", text_index}
             };
             if (!write_sse_event(client_sink, "content_block_stop", content_stop)) {
                 client_sink.done();
@@ -1097,7 +1200,7 @@ void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
             if (started_tool_blocks[idx] && !stopped_tool_blocks[idx]) {
                 json tool_stop = {
                     {"type", "content_block_stop"},
-                    {"index", static_cast<int>(idx) + 1}
+                    {"index", tool_block_indices[idx]}
                 };
                 if (!write_sse_event(client_sink, "content_block_stop", tool_stop)) {
                     client_sink.done();
