@@ -6,6 +6,7 @@
 #include "lemon/ollama_api.h"
 #include "lemon/thinking_controls.h"
 #include "lemon/utils/http_client.h"
+#include "lemon/utils/json_utils.h"
 #include "lemon/utils/session_utils.h"
 #include <iostream>
 #include <sstream>
@@ -1317,6 +1318,7 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
 
         if (stream) {
             openai_req["stream"] = true;
+            utils::JsonUtils::request_streamed_usage(openai_req);
             std::string openai_body = openai_req.dump();
 
             res.set_header("Cache-Control", "no-cache");

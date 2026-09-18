@@ -106,6 +106,14 @@ void JsonUtils::add_legacy_max_tokens_alias(json& request) {
     }
 }
 
+void JsonUtils::request_streamed_usage(json& request) {
+    json& stream_options = request["stream_options"];
+    if (!stream_options.is_object()) {
+        stream_options = json::object();
+    }
+    stream_options["include_usage"] = true;
+}
+
 json JsonUtils::with_legacy_max_tokens_alias(const json& request) {
     json modified = request;
     add_legacy_max_tokens_alias(modified);

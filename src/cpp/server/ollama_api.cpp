@@ -3,6 +3,7 @@
 #include "lemon/model_types.h"
 #include "lemon/runtime_config.h"
 #include "lemon/thinking_controls.h"
+#include "lemon/utils/json_utils.h"
 #include <iostream>
 #include <lemon/utils/aixlog.hpp>
 #include <sstream>
@@ -689,6 +690,14 @@ void OllamaApi::stream_sse_to_ndjson(const std::string& openai_body,
                         eval_count = usage["completion_tokens"].get<int>();
                 }
 
+                const bool usage_only_frame =
+                    !openai_chunk.contains("choices") ||
+                    !openai_chunk["choices"].is_array() ||
+                    openai_chunk["choices"].empty();
+                if (usage_only_frame) {
+                    continue;
+                }
+
                 auto ollama_chunk = convert_chunk(openai_chunk);
                 std::string ndjson = ollama_chunk.dump() + "\n";
                 if (!client_sink.write(ndjson.c_str(), ndjson.size())) {
@@ -798,6 +807,7 @@ void OllamaApi::handle_chat(const httplib::Request& req, httplib::Response& res)
 
             // Set streaming body as OpenAI format with stream=true
             openai_req["stream"] = true;
+            utils::JsonUtils::request_streamed_usage(openai_req);
             std::string openai_body = openai_req.dump();
 
             res.set_chunked_content_provider(
@@ -912,6 +922,7 @@ void OllamaApi::handle_generate(const httplib::Request& req, httplib::Response& 
             LOG(INFO, "OllamaApi") << "POST /api/generate - Streaming (model: " << model << ")" << std::endl;
 
             openai_req["stream"] = true;
+            utils::JsonUtils::request_streamed_usage(openai_req);
             std::string openai_body = openai_req.dump();
 
             res.set_chunked_content_provider(
